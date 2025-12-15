@@ -701,6 +701,7 @@ def save_model(
     model: nn.Module,
     *,
     donate_model: bool = False,
+    index_only: bool = False,
 ) -> None:
     """Save model weights and metadata index into specified directory."""
     if isinstance(save_path, str):
@@ -738,7 +739,8 @@ def save_model(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
-        mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
+        if not index_only:
+            mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
         for weight_name in shard.keys():
             index_data["weight_map"][weight_name] = shard_name
