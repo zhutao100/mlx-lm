@@ -5,6 +5,13 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
+try:
+    import lm_eval  # noqa: F401
+except ModuleNotFoundError as exc:
+    raise unittest.SkipTest(
+        "Optional dependency 'lm_eval' is required for evaluation tests."
+    ) from exc
+
 from mlx_lm.evaluate import MLXLM
 
 
