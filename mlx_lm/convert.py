@@ -97,6 +97,7 @@ def convert(
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
     trust_remote_code: bool = False,
+    dry_run: bool = False,
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -161,16 +162,18 @@ def convert(
         config.pop("quantization_config", None)
         model = dequantize_model(model)
 
-    save(
-        mlx_path,
-        hf_path,
-        model,
-        tokenizer,
-        config,
-    )
+    if not dry_run:
+        print(f"[INFO] Saving to {mlx_path}")
+        save(
+            mlx_path,
+            hf_path,
+            model,
+            tokenizer,
+            config,
+        )
 
-    if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo)
+        if upload_repo is not None:
+            upload_to_hub(mlx_path, upload_repo)
 
 
 def configure_parser() -> argparse.ArgumentParser:
@@ -245,6 +248,12 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trust-remote-code",
         help="Trust remote code when loading tokenizer.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--dry-run",
+        help="Perform all operations except saving the model.",
         action="store_true",
         default=False,
     )
