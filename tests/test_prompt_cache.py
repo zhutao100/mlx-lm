@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     MambaCache,
     QuantizedKVCache,
+    QuantizedRotatingKVCache,
     RotatingKVCache,
     load_prompt_cache,
     make_prompt_cache,
@@ -302,6 +303,73 @@ class TestPromptCache(unittest.TestCase):
         save_prompt_cache(cache_file, cache, metadata)
         _, loaded_metadata = load_prompt_cache(cache_file, return_metadata=True)
         self.assertEqual(metadata, loaded_metadata)
+
+    def test_save_load_quantized_rotating_cache(self):
+        cache_file = os.path.join(self.test_dir, "quantized_rotating_cache.safetensors")
+
+        cache = [RotatingKVCache(max_size=8, keep=2) for _ in range(4)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 10, 32))
+            c.update_and_fetch(x, x)
+
+        qcache = [c.to_quantized(bits=8, group_size=32) for c in cache]
+        save_prompt_cache(cache_file, qcache)
+        loaded_cache = load_prompt_cache(cache_file)
+
+        self.assertEqual(len(qcache), len(loaded_cache))
+        for c, lc in zip(qcache, loaded_cache):
+            self.assertIsInstance(lc, QuantizedRotatingKVCache)
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.keep, lc.keep)
+            self.assertEqual(c.max_size, lc.max_size)
+            self.assertEqual(c.bits, lc.bits)
+            self.assertEqual(c.group_size, lc.group_size)
+            self.assertEqual(c._idx, lc._idx)
+            for i in range(3):
+                self.assertTrue(mx.array_equal(c.state[0][i], lc.state[0][i]))
+                self.assertTrue(mx.array_equal(c.state[1][i], lc.state[1][i]))
+
+        # Rotation/update parity after reload
+        x = mx.random.uniform(shape=(1, 8, 1, 32))
+        for c, lc in zip(qcache, loaded_cache):
+            k, v = c.update_and_fetch(x, x)
+            lk, lv = lc.update_and_fetch(x, x)
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c._idx, lc._idx)
+            for i in range(3):
+                self.assertTrue(mx.array_equal(k[i], lk[i]))
+                self.assertTrue(mx.array_equal(v[i], lv[i]))
+
+    def test_rotating_to_quantized_preserves_window_mask_after_concat(self):
+        cache = RotatingKVCache(max_size=8, keep=2)
+        kv = mx.random.uniform(shape=(1, 1, 10, 32))
+        cache.update_and_fetch(kv, kv)
+
+        float_mask = cache.make_mask(1, window_size=5)
+        qcache = cache.to_quantized(bits=8, group_size=32)
+        self.assertIsInstance(qcache, QuantizedRotatingKVCache)
+        q_mask = qcache.make_mask(1, window_size=5)
+
+        self.assertTrue(mx.array_equal(float_mask, q_mask))
+
+    def test_rotating_to_quantized_dequantize_close_to_float(self):
+        cache = RotatingKVCache(max_size=8, keep=2)
+        kv = mx.random.uniform(shape=(1, 1, 10, 32))
+        cache.update_and_fetch(kv, kv)
+
+        qcache = cache.to_quantized(bits=8, group_size=32)
+        qk, qv = qcache.state
+        deq_k = mx.dequantize(*qk, group_size=qcache.group_size, bits=qcache.bits)
+        deq_v = mx.dequantize(*qv, group_size=qcache.group_size, bits=qcache.bits)
+
+        fk, fv = cache.state
+        if fk.shape[2] > cache.max_size:
+            trim_size = fk.shape[2] - cache.max_size
+            fk = cache._trim(trim_size, fk)
+            fv = cache._trim(trim_size, fv)
+
+        self.assertTrue(mx.allclose(deq_k, fk, rtol=1e-2, atol=1e-2))
+        self.assertTrue(mx.allclose(deq_v, fv, rtol=1e-2, atol=1e-2))
 
     def test_cache_to_quantized(self):
         model, tokenizer = self.model, self.tokenizer
