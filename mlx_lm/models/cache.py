@@ -524,7 +524,236 @@ class RotatingKVCache(_BaseCache):
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
-        raise NotImplementedError("RotatingKVCache Quantization NYI")
+        quant_cache = QuantizedRotatingKVCache(
+            max_size=self.max_size, keep=self.keep, group_size=group_size, bits=bits
+        )
+        quant_cache.offset = self.offset
+
+        if self.keys is None:
+            return quant_cache
+
+        keys, values = self.state
+        idx = self._idx
+
+        # The concat update path can temporarily grow the cache above max_size.
+        # In the float cache this gets trimmed on the next in-place (S==1)
+        # update; trim here to avoid quantizing the transient oversized buffer.
+        if keys.shape[-2] > self.max_size:
+            trim_size = keys.shape[-2] - self.max_size
+            keys = self._trim(trim_size, keys)
+            values = self._trim(trim_size, values)
+            idx = self.max_size
+        else:
+            idx = min(idx, keys.shape[-2])
+
+        quant_cache._idx = idx
+        quant_cache.keys = mx.quantize(keys, group_size=group_size, bits=bits)
+        quant_cache.values = mx.quantize(values, group_size=group_size, bits=bits)
+        return quant_cache
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size - 1, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            else:
+                return "causal"
+        else:
+            if window_size is None:
+                return None
+            # May need a mask for when window_size < max_size
+            if self.offset >= window_size and self.max_size > window_size:
+                idx = self._idx
+                if idx >= self.max_size:
+                    idx = 0
+                if self.offset < self.max_size:
+                    mask_size = self.offset + 1
+                else:
+                    mask_size = self.max_size
+                mask = mx.arange(mask_size) >= (mask_size - window_size)
+                mask = mx.roll(mask, shift=idx + 1)
+                return mask
+
+
+class QuantizedRotatingKVCache(QuantizedKVCache):
+    def __init__(
+        self, max_size: int, keep: int = 0, group_size: int = 64, bits: int = 8
+    ):
+        super().__init__(group_size=group_size, bits=bits)
+        self.keep = keep
+        self.max_size = max_size
+        self._idx = 0
+
+    def __len__(self):
+        return min(self.offset, self.max_size)
+
+    def _trim(self, trim_size: int, v, append=None):
+        def trim_one(x, app):
+            if trim_size > 0:
+                to_cat = [x[..., : self.keep, :], x[..., trim_size + self.keep :, :]]
+            else:
+                to_cat = [x]
+            if app is not None:
+                to_cat.append(app)
+            return mx.concatenate(to_cat, axis=-2)
+
+        if append is None:
+            return tuple(trim_one(x, None) for x in v)
+        return tuple(trim_one(x, app) for x, app in zip(v, append))
+
+    def _temporal_order(self, v):
+        """
+        Rearrange the cache into temporal order, slicing off the end if unused.
+        """
+        length = v[0].shape[-2]
+        if self._idx == length:
+            return v
+        elif self._idx < self.offset:
+
+            def reorder(x):
+                return mx.concatenate(
+                    [
+                        x[..., : self.keep, :],
+                        x[..., self._idx :, :],
+                        x[..., self.keep : self._idx, :],
+                    ],
+                    axis=-2,
+                )
+
+            return tuple(reorder(x) for x in v)
+        else:
+            return tuple(x[..., : self._idx, :] for x in v)
+
+    def _update_concat(self, keys, values):
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        q_values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+
+        if self.keys is None:
+            self.keys = q_keys
+            self.values = q_values
+        else:
+            # Put the keys/values in temporal order to preserve context
+            self.keys = self._temporal_order(self.keys)
+            self.values = self._temporal_order(self.values)
+            self._idx = self.keys[0].shape[-2]
+
+            # The largest size is self.max_size + S - 1 to ensure every token
+            # gets at least self.max_size context.
+            trim_size = self._idx - self.max_size + 1
+            self.keys = self._trim(trim_size, self.keys, q_keys)
+            self.values = self._trim(trim_size, self.values, q_values)
+
+        self.offset += keys.shape[-2]
+        self._idx = self.keys[0].shape[-2]
+        return self.keys, self.values
+
+    def _update_in_place(self, keys, values):
+        B, n_kv_heads, S, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        prev = self.offset
+
+        def init_quant(num_steps, dim, dtype):
+            el_per_int = 8 * mx.uint32.size // self.bits
+            shape = (B, n_kv_heads, num_steps)
+            return (
+                mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, dim // self.group_size), dtype=dtype),
+                mx.zeros((*shape, dim // self.group_size), dtype=dtype),
+            )
+
+        if self.keys is None or (
+            prev >= self.keys[0].shape[-2] and self.keys[0].shape[-2] < self.max_size
+        ):
+            new_size = min(self.step, self.max_size - prev)
+            new_k = init_quant(new_size, k_head_dim, keys.dtype)
+            new_v = init_quant(new_size, v_head_dim, values.dtype)
+
+            if self.keys is not None:
+                self.keys = tuple(
+                    mx.concatenate([x, nx], axis=-2) for x, nx in zip(self.keys, new_k)
+                )
+                self.values = tuple(
+                    mx.concatenate([x, nx], axis=-2)
+                    for x, nx in zip(self.values, new_v)
+                )
+            else:
+                self.keys = new_k
+                self.values = new_v
+            self._idx = prev
+
+        # Trim if needed
+        trim_size = self.keys[0].shape[-2] - self.max_size
+        if trim_size > 0:
+            self.keys = self._trim(trim_size, self.keys)
+            self.values = self._trim(trim_size, self.values)
+            self._idx = self.max_size
+
+        # Rotate
+        if self._idx == self.max_size:
+            self._idx = self.keep
+
+        # Assign
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        q_values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., self._idx : self._idx + S, :] = q_keys[i]
+            self.values[i][..., self._idx : self._idx + S, :] = q_values[i]
+
+        self.offset += S
+        self._idx += S
+
+        length = min(self.offset, self.keys[0].shape[-2])
+        return tree_map(lambda x: x[..., :length, :], (self.keys, self.values))
+
+    def update_and_fetch(self, keys, values):
+        if keys.shape[-2] == 1:
+            return self._update_in_place(keys, values)
+        return self._update_concat(keys, values)
+
+    @property
+    def state(self):
+        length = min(self.offset, self.keys[0].shape[-2])
+        if length == self.keys[0].shape[-2]:
+            return self.keys, self.values
+        return tree_map(lambda x: x[..., :length, :], (self.keys, self.values))
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.group_size,
+                    self.bits,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.keep, self.max_size, self.offset, self._idx, self.group_size, self.bits = (
+            map(int, v)
+        )
+
+    def is_trimmable(self):
+        return self.offset < self.max_size
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        self._idx -= n
+        return n
 
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
