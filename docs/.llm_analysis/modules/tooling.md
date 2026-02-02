@@ -19,4 +19,3 @@ Captures repo-level developer tooling and hygiene conventions (formatting, ignor
 ## Observations / Opportunities
 - The formatter-only pre-commit setup is intentionally low-friction; adding basic hygiene hooks (whitespace/EOF) and optional linting (e.g., Ruff) could catch more issues automatically if desired.
 - Ignored artifacts can still accumulate locally (e.g., `.DS_Store`, `__pycache__/`); periodic cleanup scripts or developer docs can help keep working trees tidy.
-
