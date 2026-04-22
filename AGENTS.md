@@ -53,3 +53,10 @@ AI-generated responses and the penalty is a project ban.
   # KeyError instead of reading an empty answer. Streaming deltas
   # are left alone: omitting fields between chunks is normal there.
 ```
+
+## Custom Fork Maintenance
+
+- Keep custom changes as small, drop-in commits on top of upstream to reduce rebase conflicts.
+- Update with `git pull origin main` with `pull.rebase=true`, using non-interactive Git commands.
+- Fold conflict resolutions into the existing commits. Remove custom changes only when upstream fully replaces their behavior, and report partial or full replacements.
+- Explicit user requests for local implementation and Conventional Commit messages take precedence over the upstream agent rules above. Do not push or create pull requests unless explicitly requested.
